@@ -1,0 +1,98 @@
+name: Build llama.cpp for Thor (aarch64 + CUDA SM101)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            cmake \
+            build-essential \
+            wget
+
+      - name: Install CUDA Toolkit for aarch64 cross-compilation
+        run: |
+          # NVIDIA 官方 CUDA 12.8 aarch64 交叉编译仓库
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          # 安装 nvcc + aarch64 CUDA 运行时/开发库
+          sudo apt-get install -y -qq \
+            cuda-nvcc-12-8 \
+            cuda-cross-aarch64-12-8
+
+      - name: Verify toolchain
+        run: |
+          aarch64-linux-gnu-gcc --version | head -1
+          nvcc --version | tail -1
+          ls /usr/local/cuda-12.8/targets/aarch64-linux/lib/ | head -5
+
+      - name: Clone llama.cpp
+        run: |
+          git clone --depth 1 --recursive https://github.com/ggerganov/llama.cpp.git llama.cpp
+
+      - name: Build (CUDA + aarch64 + SM101)
+        run: |
+          cd llama.cpp
+          mkdir -p build && cd build
+
+          # 关键参数:
+          #   CMAKE_SYSTEM_NAME=Linux + CMAKE_SYSTEM_PROCESSOR=aarch64 → 交叉编译
+          #   CMAKE_CUDA_ARCHITECTURES=101 → Blackwell Thor iGPU SM 10.1
+          #   CMAKE_CUDA_FLAGS 中指定 aarch64 gcc 作为 host compiler
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_C_FLAGS="-O3" \
+            -DCMAKE_CXX_FLAGS="-O3" \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=101 \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+            "-DCMAKE_CUDA_FLAGS=--compiler-path=/usr/bin/aarch64-linux-gnu-gcc;-O3" \
+            -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/aarch64-linux-gnu-g++ \
+            -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_BUILD_TYPE=Release
+
+          make -j$(nproc) 2>&1 | tail -5
+
+      - name: Package binaries + CUDA runtime libs
+        run: |
+          cd llama.cpp/build/bin
+
+          # 找到 CUDA aarch64 运行时库
+          CUDA_LIBS=/usr/local/cuda-12.8/targets/aarch64-linux/lib
+
+          tar czf /tmp/llama-cuda-thor.tar.gz \
+            llama-cli \
+            llama-server \
+            llama-benchmark \
+            llama-quantize \
+            ${CUDA_LIBS}/libcudart.so.12 \
+            ${CUDA_LIBS}/libcublas.so.12 \
+            ${CUDA_LIBS}/libcublasLt.so.12
+
+          ls -lh /tmp/llama-cuda-thor.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cuda-thor
+          path: /tmp/llama-cuda-thor.tar.gz
+          retention-days: 90
+          compression-level: 0
