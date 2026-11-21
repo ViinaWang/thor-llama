@@ -16,48 +16,48 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Build in arm64 Docker container
+      - name: Build in arm64 Docker with CUDA from SBSA apt repo
         run: |
           mkdir -p output
           docker run --rm \
             --platform linux/arm64 \
             -v $(pwd)/output:/output \
             ubuntu:24.04 \
-            bash -c '
-              set -e
-              echo "=== Arch check ==="
-              uname -m
-              cat /etc/os-release | head -2
+            bash -euxo pipefail '
+              echo "=== Arch: $(uname -m) ==="
 
-              echo "=== Install deps ==="
               apt-get update -qq
-              apt-get install -y -qq cmake build-essential wget git file
+              apt-get install -y -qq \
+                cmake build-essential wget git file gnupg
 
-              echo "=== Download CUDA 12.8 aarch64 ==="
-              wget -q https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_565.57.01_linux_sbsa_aarch64.deb
-              dpkg -i cuda_12.8.0_565.57.01_linux_sbsa_aarch64.deb 2>/dev/null || true
-              apt-get install -yf -qq 2>/dev/null || true
+              echo "=== Install CUDA 12.8 via SBSA apt (native aarch64) ==="
+              wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+              dpkg -i cuda-keyring_1.1-1_all.deb
+              apt-get update -qq
 
-              # 如果 dpkg 不行, 用 runfile
-              if ! command -v nvcc &>/dev/null; then
-                echo "dpkg failed, trying runfile..."
-                wget -q https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_565.57.01_linux_sbsa_aarch64.run
-                chmod +x cuda_12.8.0_565.57.01_linux_sbsa_aarch64.run
-                ./cuda_12.8.0_565.57.01_linux_sbsa_aarch64.run --silent --toolkit 2>/dev/null || true
+              # 安装 nvcc (aarch64 原生版, 从 SBSA 仓库)
+              apt-get install -y -qq cuda-nvcc-12-8 2>/dev/null || \
+              apt-get install -y -qq cuda-nvcc-12-8 cuda-libraries-12-8 2>/dev/null || \
+              apt-get install -y -qq cuda-toolkit-12-8
+
+              # 验证 nvcc
+              if command -v nvcc &>/dev/null; then
+                nvcc --version | tail -1
+              elif [ -f /usr/local/cuda-12.8/bin/nvcc ]; then
                 export PATH=/usr/local/cuda-12.8/bin:$PATH
+                nvcc --version | tail -1
+              elif [ -f /usr/local/cuda/bin/nvcc ]; then
+                export PATH=/usr/local/cuda/bin:$PATH
+                nvcc --version | tail -1
+              else
+                echo "ERROR: nvcc not found after install"
+                dpkg -l | grep cuda | head -10
+                apt-cache search cuda-nvcc | head -5
+                exit 1
               fi
 
-              # 最终检查
-              nvcc --version 2>/dev/null | tail -1 || {
-                echo "=== Fallback: trying apt repo ==="
-                apt-get install -y -qq software-properties-common gnupg
-                wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
-                dpkg -i cuda-keyring_1.1-1_all.deb 2>/dev/null || true
-                apt-get update -qq
-                apt-get install -y -qq cuda-nvcc-12-8 2>/dev/null || true
-                ls /usr/local/cuda*/bin/nvcc 2>/dev/null || echo "NO NVCC"
-                nvcc --version 2>/dev/null | tail -1
-              }
+              # CUDA 库路径
+              export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
 
               echo "=== Clone and build llama.cpp ==="
               git clone --depth 1 https://github.com/ggerganov/llama.cpp.git /tmp/llama.cpp
@@ -71,23 +71,22 @@ jobs:
 
               make -j4
 
-              echo "=== Verify ==="
-              file bin/llama-cli
-              file bin/llama-server
+              echo "=== Verify output ==="
+              file bin/llama-cli | grep -q "ARM aarch64" && echo "✓ aarch64 binary" || echo "✗ wrong arch"
+              file bin/llama-cli | grep -q "ARM aarch64" || exit 1
 
-              echo "=== Copy to output ==="
+              echo "=== Copy artifacts ==="
               cp bin/llama-cli bin/llama-server bin/llama-benchmark bin/llama-quantize /output/
 
-              # 也复制 CUDA 运行时库 (如果不在系统路径)
-              for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libggml-cuda.so; do
-                found=$(find /usr/local/cuda* /usr/lib /lib -name "$lib" 2>/dev/null | head -1)
-                [ -n "$found" ] && cp "$found" /output/ && echo "Copied: $lib"
+              # 复制共享库
+              for lib in libggml*.so; do
+                [ -f "bin/$lib" ] && cp "bin/$lib" /output/
               done
 
-              # 复制 libggml 共享库
-              for lib in libggml.so libggml-base.so; do
-                found=$(find /tmp/llama.cpp/build -name "$lib" 2>/dev/null | head -1)
-                [ -n "$found" ] && cp "$found" /output/
+              # 复制 CUDA 运行时 (如果不在系统路径)
+              for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+                found=$(find /usr/local/cuda* /usr/lib /lib -name "$lib" 2>/dev/null | head -1)
+                [ -n "$found" ] && cp "$found" /output/ && echo "Copied: $lib" || true
               done
 
               echo "=== Done ==="
@@ -100,7 +99,6 @@ jobs:
           ls -la
           tar czf ../llama-cuda-thor.tar.gz *
           cd ..
-          file output/llama-cli | grep -q "ARM aarch64" && echo "✓ aarch64 confirmed" || echo "⚠ Check binary arch"
           ls -lh llama-cuda-thor.tar.gz
 
       - name: Upload artifact
