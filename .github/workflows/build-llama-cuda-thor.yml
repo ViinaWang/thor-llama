@@ -16,50 +16,32 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Build in arm64 Docker with CUDA from SBSA apt repo
+      - name: Pull and verify NVIDIA CUDA arm64 image
+        run: |
+          # NVIDIA 官方 CUDA 镜像 — multi-arch (包含 arm64 变体)
+          # "devel" = 包含 nvcc + 头文件 + 开发库 (不只是运行时)
+          docker pull --platform linux/arm64 nvidia/cuda:12.8.0-devel-ubuntu24.04
+          docker image inspect nvidia/cuda:12.8.0-devel-ubuntu24.04 | grep -E "Architecture|Os" | head -3
+
+      - name: Build llama.cpp in CUDA arm64 container
         run: |
           mkdir -p output
           docker run --rm \
             --platform linux/arm64 \
             -v $(pwd)/output:/output \
-            ubuntu:24.04 \
+            nvidia/cuda:12.8.0-devel-ubuntu24.04 \
             bash -euxo pipefail '
               echo "=== Arch: $(uname -m) ==="
 
+              # CUDA 已预装 — 验证
+              nvcc --version | tail -1
+              ls /usr/local/cuda/lib64/ | head -5
+
+              # 安装编译依赖
               apt-get update -qq
-              apt-get install -y -qq \
-                cmake build-essential wget git file gnupg
+              apt-get install -y -qq cmake git
 
-              echo "=== Install CUDA 12.8 via SBSA apt (native aarch64) ==="
-              wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
-              dpkg -i cuda-keyring_1.1-1_all.deb
-              apt-get update -qq
-
-              # 安装 nvcc (aarch64 原生版, 从 SBSA 仓库)
-              apt-get install -y -qq cuda-nvcc-12-8 2>/dev/null || \
-              apt-get install -y -qq cuda-nvcc-12-8 cuda-libraries-12-8 2>/dev/null || \
-              apt-get install -y -qq cuda-toolkit-12-8
-
-              # 验证 nvcc
-              if command -v nvcc &>/dev/null; then
-                nvcc --version | tail -1
-              elif [ -f /usr/local/cuda-12.8/bin/nvcc ]; then
-                export PATH=/usr/local/cuda-12.8/bin:$PATH
-                nvcc --version | tail -1
-              elif [ -f /usr/local/cuda/bin/nvcc ]; then
-                export PATH=/usr/local/cuda/bin:$PATH
-                nvcc --version | tail -1
-              else
-                echo "ERROR: nvcc not found after install"
-                dpkg -l | grep cuda | head -10
-                apt-cache search cuda-nvcc | head -5
-                exit 1
-              fi
-
-              # CUDA 库路径
-              export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
-
-              echo "=== Clone and build llama.cpp ==="
+              # 编译 llama.cpp
               git clone --depth 1 https://github.com/ggerganov/llama.cpp.git /tmp/llama.cpp
               cd /tmp/llama.cpp
               mkdir -p build && cd build
@@ -71,25 +53,24 @@ jobs:
 
               make -j4
 
-              echo "=== Verify output ==="
-              file bin/llama-cli | grep -q "ARM aarch64" && echo "✓ aarch64 binary" || echo "✗ wrong arch"
-              file bin/llama-cli | grep -q "ARM aarch64" || exit 1
+              # 验证
+              file bin/llama-cli | grep -q "ARM aarch64" && echo "✓ aarch64 binary" || exit 1
+              file bin/llama-cli | grep -q "ARM aarch64" || { echo "✗ wrong arch"; exit 1; }
 
-              echo "=== Copy artifacts ==="
+              # 复制产物
               cp bin/llama-cli bin/llama-server bin/llama-benchmark bin/llama-quantize /output/
 
-              # 复制共享库
               for lib in libggml*.so; do
                 [ -f "bin/$lib" ] && cp "bin/$lib" /output/
               done
 
-              # 复制 CUDA 运行时 (如果不在系统路径)
+              # 复制 CUDA 运行时
               for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-                found=$(find /usr/local/cuda* /usr/lib /lib -name "$lib" 2>/dev/null | head -1)
+                found=$(find /usr/local/cuda /usr/lib -name "$lib" 2>/dev/null | head -1)
                 [ -n "$found" ] && cp "$found" /output/ && echo "Copied: $lib" || true
               done
 
-              echo "=== Done ==="
+              echo "=== Artifacts ==="
               ls -la /output/
             '
 
